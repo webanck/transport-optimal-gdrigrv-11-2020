@@ -28,7 +28,6 @@
 #include <random>
 #include <vector>
 #include <array>
-#include <pair>
 #include <tuple>
 #include <algorithm> //clamp
 #include <cassert>
@@ -154,11 +153,12 @@ void checkNormalizedColor(const Sample& sample)
     std::cout << "WARNING: Color " << color << " is not normalized at pixel (" << i << ", " << j << ")!" << std::endl;
   }
 }
-void computeOffsets(const Vector& direction, const std::vector<Sample>& targetSamples, std::vector<Sample>& sourceSamples)
+double computeOffsetsAndCost(const Vector& direction, const std::vector<Sample>& targetSamples, std::vector<Sample>& sourceSamples)
 {
+  double cost(0.);
   for(auto i = 0; i < targetSamples.size(); i++)
   {
-    //Vector offsetVector;
+    //Offset.
     const double delta = std::get<0>(targetSamples[i]) - std::get<0>(sourceSamples[i]);
     for(unsigned int d = 0; d < DIMENSIONS; d++)
     {
@@ -166,7 +166,10 @@ void computeOffsets(const Vector& direction, const std::vector<Sample>& targetSa
       std::get<3>(sourceSamples[i])[d] += offset;
     }
     //checkNormalizedColor(sourceSamples[i]);
+    //Cost.
+    cost += delta*delta;
   }
+  return cost;
 }
 void advectSamples(const unsigned int batchSize, std::vector<Sample>& sourceSamples)
 {
@@ -257,6 +260,7 @@ void computation(const unsigned int nbBatchs, const unsigned int batchSize, cons
   {
     if(!silent) std::cout << "  " << batch + 1 << "/" << nbBatchs << ":" << std::endl;
 
+    double cost(0.);
     for(unsigned int iteration = 0u; iteration < batchSize; iteration++)
     {
         //if(!silent) std::cout << "  SOT iterations:" << std::endl;
@@ -267,10 +271,13 @@ void computation(const unsigned int nbBatchs, const unsigned int batchSize, cons
         //Sort images pixels projections on the random direction.
         sortSamples(direction, sourceSamples);
         sortSamples(direction, targetSamples);
-        computeOffsets(direction, targetSamples, sourceSamples);
+        cost += computeOffsetsAndCost(direction, targetSamples, sourceSamples);
     }
     advectSamples(batchSize, sourceSamples);
     //checkAdvection(direction, targetSamples, sourceSamples);
+    cost /= batchSize;
+
+    if(!silent) std::cout << "    SOT cost:" << cost << std::endl;
   }
 
   //Save result.
