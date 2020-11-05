@@ -42,13 +42,21 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+//OPENMP
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 //Global flag to silent verbose messages
 bool silent;
 //Global images dimensions.
 int width, height, nbChannels;
 const unsigned int DIMENSIONS = 3u;
+//Global threads number.
+unsigned int nbThreads;
 using Vector = std::array<double, DIMENSIONS>;
-using Sample = std::tuple<double, unsigned int, Vector, Vector>; //(projection, index, color, offset)
+//using Sample = std::tuple<double, unsigned int, Vector, Vector>; //(projection, index, color, offset)
+using Sample = Vector; //(color)
 
 unsigned int pixelIndex(const unsigned int i, const unsigned int j)
 {
@@ -123,24 +131,21 @@ double projection(const Vector& d, const Vector& v)
 {
   return dot(d, v);
 }
-void projectSamples(const Vector& d, std::vector<Sample>& samples)
+void projectSamples(const Vector& d, const std::vector<Sample>& samples, std::vector<std::pair<double, unsigned int>>& projectionsSamples)
 {
-  for(auto& sample : samples)
-  {
-    const Vector& color = std::get<2>(sample);
-    std::get<0>(sample) = projection(d, color);
-  }
+  for(unsigned int i = 0u; i < samples.size(); i++)
+    projectionsSamples[i] = {projection(d, samples[i]), i};
 }
-void sortSamples(const Vector& direction, std::vector<Sample>& samples)
+void sortSamples(const Vector& direction, const std::vector<Sample>& samples, std::vector<std::pair<double, unsigned int>>& projectionsSamples)
 {
-  projectSamples(direction, samples);
-  std::sort(samples.begin(), samples.end());
-  //std::sort(samples.begin(), samples.end(), [](const Sample& s1, const Sample& s2){return std::get<0>(s1) < std::get<0>(s2);});
+  projectSamples(direction, samples, projectionsSamples);
+  std::sort(projectionsSamples.begin(), projectionsSamples.end());
+  //std::sort(projectionsSamples.begin(), projectionsSamples.end(), [](const Sample& s1, const Sample& s2){return s1.first < s2.first;});
 }
 void checkNormalizedColor(const Sample& sample)
 {
   bool normalized(true);
-  const Vector& color(std::get<2>(sample));
+  const Vector& color(sample);
   for(const auto x : color)
     if(x < 0. || x > 1.)
     {
@@ -148,76 +153,61 @@ void checkNormalizedColor(const Sample& sample)
       break;
     }
   if(!normalized)
-  {
-    const auto [i, j] = indexPixel(std::get<1>(sample));
-    std::cout << "WARNING: Color " << color << " is not normalized at pixel (" << i << ", " << j << ")!" << std::endl;
-  }
+    std::cout << "WARNING: Color " << color << " is not normalized!" << std::endl;
 }
-double computeOffsetsAndCost(const Vector& direction, const std::vector<Sample>& targetSamples, std::vector<Sample>& sourceSamples)
+double computeOffsetsAndCost(
+    const Vector& direction,
+    const std::vector<Sample>& targetSamples, const std::vector<std::pair<double, unsigned int>>& targetProjectionsSamples,
+    const std::vector<Sample>& sourceSamples, const std::vector<std::pair<double, unsigned int>>& sourceProjectionsSamples,
+    std::vector<Vector>& offsets
+)
 {
   double cost(0.);
-  for(auto i = 0; i < targetSamples.size(); i++)
+  for(auto i = 0; i < sourceProjectionsSamples.size(); i++)
   {
     //Offset.
-    const double delta = std::get<0>(targetSamples[i]) - std::get<0>(sourceSamples[i]);
+    const double delta = targetProjectionsSamples[i].first - sourceProjectionsSamples[i].first;
+    const unsigned int index = sourceProjectionsSamples[i].second;
     for(unsigned int d = 0; d < DIMENSIONS; d++)
     {
       const double offset = delta * direction[d];
-      std::get<3>(sourceSamples[i])[d] += offset;
+      offsets[index][d] = offset;
     }
-    //checkNormalizedColor(sourceSamples[i]);
+    //checkNormalizedColor(sourceSamples[index]);
     //Cost.
     cost += delta*delta;
   }
   return cost;
 }
-void advectSamples(const unsigned int batchSize, std::vector<Sample>& sourceSamples)
+void advectSamples(const double normalizationFactor, const std::vector<Vector>& offsets, std::vector<Sample>& samples)
 {
-  for(auto i = 0; i < sourceSamples.size(); i++)
+  #pragma omp parallel for
+  for(auto i = 0; i < samples.size(); i++)
     for(auto d = 0; d < DIMENSIONS; d++)
     {
-      double& component = std::get<2>(sourceSamples[i])[d];
-      double& offset = std::get<3>(sourceSamples[i])[d];
-      component = std::clamp(component + offset/batchSize, 0., 1.);
-      offset = 0.;
+      double& component = samples[i][d];
+      component = std::clamp(component + offsets[i][d]*normalizationFactor, 0., 1.);
     }
-}
-void checkAdvection(const Vector& direction, const std::vector<Sample>& targetSamples, const std::vector<Sample>& sourceSamples)
-{
-  std::vector<Sample> checkSamples(sourceSamples);
-  projectSamples(direction, checkSamples);
-  for(auto i = 0; i < targetSamples.size(); i++)
-  {
-    const double delta = std::get<0>(targetSamples[i]) - std::get<0>(checkSamples[i]);
-    if(std::abs(delta) > 0.001)
-    {
-      std::cout << "WARNING: wrong advection with an advected delta of " << delta << "!" << std::endl;
-      break;
-    }
-  }
 }
 std::vector<Sample> imageSamples(const unsigned char * image)
 {
-  std::vector<Sample> samples;
-  samples.reserve(width*height);
+  std::vector<Sample> samples(width * height);
   for(auto i = 0 ; i < width ; ++i) for(auto j = 0; j < height; ++j)
   {
     const int pIndex = pixelIndex(i, j);
     const int cIndex = componentIndex(pIndex);
-    Vector color;
+    Vector& color = samples[pIndex];
     for(auto d = 0; d < DIMENSIONS; d++)
       color[d] = image[cIndex + d]/255.;
-    samples.emplace_back(0., pIndex, color, Vector());
-    //checkNormalizedColor(samples.back());
   }
   return samples;
 }
 
 void outputSamples(const std::vector<Sample>& samples, std::vector<unsigned char>& output)
 {
-  for(const auto& sample : samples)
+  for(unsigned int pIndex = 0u; pIndex < samples.size(); pIndex++)
   {
-    const auto [projection, pIndex, color, offset] = sample;
+    const Vector& color = samples[pIndex];
     const auto cIndex = componentIndex(pIndex);
     for(auto d = 0; d < DIMENSIONS; d++)
       //output[cIndex + d] = color[d]*255.;
@@ -229,6 +219,13 @@ void outputSamples(const std::vector<Sample>& samples, std::vector<unsigned char
   }
 }
 
+struct IterationData {
+    Vector direction;
+    std::vector<std::pair<double, unsigned int>> targetProjectionsSamples;
+    std::vector<std::pair<double, unsigned int>> sourceProjectionsSamples;
+    std::vector<Vector> offsets;
+    double cost;
+};
 void computation(const unsigned int nbBatchs, const unsigned int batchSize, const unsigned char * source, const unsigned char * target, std::vector<unsigned char>& output)
 {
   /*
@@ -254,27 +251,54 @@ void computation(const unsigned int nbBatchs, const unsigned int batchSize, cons
   auto sourceSamples = imageSamples(source);
   auto targetSamples = imageSamples(target);
 
+  //Iterations data.
+  std::vector<IterationData> iterationsData(batchSize);
+  for(auto& it : iterationsData)
+  {
+    it.targetProjectionsSamples.resize(targetSamples.size());
+    it.sourceProjectionsSamples.resize(sourceSamples.size());
+    it.offsets.resize(sourceSamples.size());
+  }
+  std::vector<Vector> mergedOffsets(sourceSamples.size());
+
   //SOT loop:
   if(!silent) std::cout << "SOT batchs:" << std::endl;
   for(unsigned int batch = 0u; batch < nbBatchs; batch++)
   {
     if(!silent) std::cout << "  " << batch + 1 << "/" << nbBatchs << ":" << std::endl;
 
-    double cost(0.);
+    //Draw batch random directions.
+    for(auto& it : iterationsData)
+      it.direction = randomDirection();
+
+    #pragma omp parallel for
     for(unsigned int iteration = 0u; iteration < batchSize; iteration++)
     {
-        //if(!silent) std::cout << "  SOT iterations:" << std::endl;
-        //Draw a random direction.
-        const Vector direction(randomDirection());
-        //if(!silent) std::cout << "    direction:" << direction << std::endl;
+      auto& it = iterationsData[iteration];
 
-        //Sort images pixels projections on the random direction.
-        sortSamples(direction, sourceSamples);
-        sortSamples(direction, targetSamples);
-        cost += computeOffsetsAndCost(direction, targetSamples, sourceSamples);
+      //Sort samples projections on the random direction.
+      sortSamples(it.direction, targetSamples, it.targetProjectionsSamples);
+      sortSamples(it.direction, sourceSamples, it.sourceProjectionsSamples);
+
+      it.cost = computeOffsetsAndCost(it.direction, targetSamples, it.targetProjectionsSamples, sourceSamples, it.sourceProjectionsSamples, it.offsets);
     }
-    advectSamples(batchSize, sourceSamples);
-    //checkAdvection(direction, targetSamples, sourceSamples);
+
+    //Compute batch offset.
+    #pragma omp parallel for
+    for(auto i = 0u; i < sourceSamples.size(); i++)
+      for(auto d = 0u; d < DIMENSIONS; d++)
+      {
+        mergedOffsets[i][d] = 0.;
+        for(auto& it : iterationsData)
+          mergedOffsets[i][d] += it.offsets[i][d];
+      }
+
+    //Advect source samples.
+    advectSamples(1./batchSize, mergedOffsets, sourceSamples);
+
+    double cost(0.);
+    for(auto& it : iterationsData)
+      cost += it.cost;
     cost /= batchSize;
 
     if(!silent) std::cout << "    SOT cost:" << cost << std::endl;
@@ -296,9 +320,14 @@ int main(int argc, char **argv)
   app.add_option("-n,--nbsteps", nbSteps, "Number of sliced steps (8)");
   unsigned int nbBatchs = 1;
   app.add_option("-b,--nbbatchs", nbBatchs, "Number of batchs (1)");
+  nbThreads = 1;
+  app.add_option("-j,--nbthreadss", nbThreads, "Number of threads (1)");
   silent = false;
   app.add_flag("--silent", silent, "No verbose messages");
   CLI11_PARSE(app, argc, argv);
+
+  //OPENMP threading.
+  omp_set_num_threads(nbThreads);
 
   //Image loading
   //int width, height, nbChannels;
